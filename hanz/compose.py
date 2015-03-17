@@ -1,5 +1,6 @@
 from ctree.frontend import get_ast
 import ast
+import inspect
 
 
 def gen_tmp():
@@ -88,6 +89,8 @@ class ControlFlowGraph(object):
         """
         :param ast.FunctionDef func:
         """
+        self.name = func.name
+        self.params = func.args
         body = map(unpack, func.body)
         self.basic_blocks = [list(reduce(lambda x, y: x + y, body, ()))]
 
@@ -122,12 +125,27 @@ class ControlFlowGraph(object):
         return output
 
 
+def compile_cfg(graph, env):
+    tree = ast.Module(
+        [ast.FunctionDef(graph.name, graph.params,
+                         graph.basic_blocks[0], [])]
+    )
+    ast.fix_missing_locations(tree)
+    exec(compile(tree, filename="file", mode="exec"), env, env)
+    return env[graph.name]
+
+
 def compose(fn):
     tree = get_ast(fn)
     cfg = ControlFlowGraph(tree.body[0])
+    frame = inspect.stack()[1][0]
+    symbol_table = frame.f_locals
+    symbol_table.update(frame.f_globals)
+    symbol_table.update(frame.f_back.f_locals)
+    symbol_table.update(frame.f_back.f_globals)
     print(cfg)
 
     def wrapped(*args, **kwargs):
-        raise NotImplementedError()
+        fn = compile_cfg(cfg, symbol_table)
         return fn(*args, **kwargs)
     return wrapped
