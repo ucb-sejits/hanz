@@ -1,3 +1,5 @@
+from hanz.liveness_analysis import perform_liveness_analysis
+
 from ctree.frontend import get_ast
 import ast
 import inspect
@@ -48,24 +50,21 @@ class CFGBuilder(ast.NodeTransformer):
                 self.curr_target = old_target
         node.right = operands[0]
         node.left = operands[1]
-        ret.append(ast.Assign([ast.Name(self.curr_target, ast.Load())], node))
+        ret.append(ast.Assign([ast.Name(self.curr_target, ast.Store())], node))
         return ret
 
     def visit_Assign(self, node):
         old_target = self.curr_target
-        if isinstance(node.value, ast.Call):
-            self.curr_target = node.targets[0]
-            ret = self.visit(node.value)
-        else:
-            self.curr_target = self._gen_tmp()
-            ret = self.visit(node.value)
-            node.value = (ast.Name(self.curr_target, ast.Load()), )
-            self.curr_target = old_target
+        self.curr_target = node.targets[0].id
+        ret = self.visit(node.value)
+        self.curr_target = old_target
         return ret
 
     def visit_Return(self, node):
         if isinstance(node.value, ast.Name):
             return node
+        elif isinstance(node.value, ast.Tuple):
+            raise NotImplementedError()
         tmp = self._gen_tmp()
         self.curr_target = tmp
         value = self.visit(node.value)
@@ -99,13 +98,25 @@ class BasicBlock(object):
     def __init__(self):
         """TODO: to be defined1. """
         self.statements = []
+        self.live_ins = set()
+        self.live_outs = set()
 
     def add_statement(self, statement):
         self.statements.append(statement)
 
+    def __getitem__(self, index):
+        return self.statements[index]
+
+    def __len__(self):
+        return len(self.statements)
+
     def dump(self, tab):
         output = tab + self.__class__.__name__ + "\n"
-        tab += "    "
+        tab += "  "
+        output += tab + "live ins: {}\n".format(", ".join(self.live_ins))
+        output += tab + "live outs: {}\n".format(", ".join(self.live_outs))
+        output += tab + "body:\n"
+        tab += "  "
         for expr in self.statements:
             if isinstance(expr, ast.Assign):
                 output += tab + "{} = {}\n".format(
@@ -235,8 +246,10 @@ class ControlFlowGraph(object):
     def find_composable_blocks(self, symbol_table):
         self.graph.body = self.separate_composable_blocks(self.graph.body,
                                                           symbol_table)
+
+    def liveness_analysis(self):
+        perform_liveness_analysis(self.graph.body)
         print(self)
-        raise NotImplementedError()
 
 
 def compose(fn):
@@ -255,6 +268,7 @@ def compose(fn):
         for index, arg in enumerate(tree.body[0].args.args):
             env[arg.id] = args[index]
         cfg.find_composable_blocks(env)
+        cfg.liveness_analysis()
         fn = cfg.compile_to_fn(env)
         return fn(*args, **kwargs)
     return wrapped
