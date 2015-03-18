@@ -3,79 +3,74 @@ import ast
 import inspect
 
 
-def gen_tmp():
-    gen_tmp.tmp += 1
-    return "_t{}".format(gen_tmp.tmp)
+class CFGBuilder(ast.NodeTransformer):
+    def __init__(self):
+        self.funcs = []
+        self.tmp = -1
+        self.curr_target = None
 
-gen_tmp.tmp = -1
+    def _gen_tmp(self):
+        self.tmp += 1
+        return "_t{}".format(self.tmp)
 
+    def visit_FunctionDecl(self, node):
+        new_body = []
+        for statement in node.body:
+            result = self.visit(statement)
+            if isinstance(result, list):
+                new_body.extend(result)
+            else:
+                new_body.append(result)
+        node.body = new_body
+        return node
 
-def unpack(expr):
-    def visit(expr, curr_target=None):
-        if isinstance(expr, ast.Return):
-            if isinstance(expr.value, (ast.Name, ast.Tuple)):
-                body = (expr, )
+    def visit_Call(self, node):
+        args = []
+        for arg in node.args:
+            if isinstance(arg, ast.Name):
+                args.append(arg)
             else:
-                tmp = gen_tmp()
-                body = visit(expr.value, ast.Name(tmp, ast.Store()))
-                body += (ast.Return(ast.Name(tmp, ast.Load())), )
-        elif isinstance(expr, ast.Name):
-            return expr
-        elif isinstance(expr, ast.BinOp):
-            body = ()
-            operands = []
+                raise NotImplementedError()
+        node.args = args
+        return [ast.Assign([ast.Name(self.curr_target, ast.Store())], node)]
 
-            if isinstance(expr.left, ast.Num):
-                body += (ast.Assign([curr_target], expr), )
+    def visit_BinOp(self, node):
+        operands = ()
+        ret = []
+        for operand in (node.right, node.left):
+            if isinstance(operand, ast.Name):
+                operands += (operand, )
             else:
-                for operand in [expr.left, expr.right]:
-                    if isinstance(operand, (ast.Name, ast.Num)):
-                        operands += (operand, )
-                    else:
-                        tmp = gen_tmp()
-                        body += visit(operand,
-                                      ast.Name(tmp, ast.Store()))
-                        operands.append(ast.Name(tmp, ast.Load()))
-                expr.left = operands[0]
-                expr.right = operands[1]
-                if curr_target is not None:
-                    body += (ast.Assign([curr_target], expr), )
-        elif isinstance(expr, ast.Assign):
-            target = expr.targets[0]
-            if isinstance(target, ast.Tuple):
-                body = reduce(lambda x, y: x + y,
-                              map(visit, expr.value.elts, target.elts), ())
-            else:
-                body = visit(expr.value, target)
-        elif isinstance(expr, ast.Call):
-            body = ()
-            args = []
-            for arg in expr.args:
-                val = visit(arg)
-                if isinstance(val, tuple):
-                    tmp = gen_tmp()
-                    val = visit(arg, ast.Name(tmp, ast.Store))
-                    body += val
-                    args.append(ast.Name(tmp, ast.Load()))
-                elif isinstance(val, (ast.Name, ast.Num)):
-                    args.append(val)
-                else:
-                    raise Exception("Call argument returned\
-                                     unsupported type {}".format(type(val)))
-            if curr_target is not None:
-                body += (ast.Assign(
-                    [curr_target],
-                    ast.Call(visit(expr.func), args, [], None, None)
-                ), )
-            else:
-                body += (ast.Call(visit(expr.func), args, [], None, None), )
-        elif isinstance(expr, ast.Expr):
-            return (ast.Expr(visit(expr.value)[0]), )
+                old_target = self.curr_target
+                self.curr_target = self._gen_tmp()
+                ret.extend(self.visit(operand))
+                operands += (ast.Name(self.curr_target, ast.Load()), )
+                self.curr_target = old_target
+        node.right = operands[0]
+        node.left = operands[1]
+        ret.append(ast.Assign([ast.Name(self.curr_target, ast.Load())], node))
+        return ret
+
+    def visit_Assign(self, node):
+        old_target = self.curr_target
+        if isinstance(node.value, ast.Call):
+            self.curr_target = node.targets[0]
+            ret = self.visit(node.value)
         else:
-            raise Exception("Unsupported expression {}".format(expr))
-        return body
+            self.curr_target = self._gen_tmp()
+            ret = self.visit(node.value)
+            node.value = (ast.Name(self.curr_target, ast.Load()), )
+            self.curr_target = old_target
+        return ret
 
-    return visit(expr)
+    def visit_Return(self, node):
+        if isinstance(node.value, ast.Name):
+            return node
+        tmp = self._gen_tmp()
+        self.curr_target = tmp
+        value = self.visit(node.value)
+        node.value = ast.Name(tmp, ast.Load())
+        return value + [node]
 
 
 op2str = {
@@ -97,21 +92,35 @@ def dump_op(op):
         raise NotImplementedError(op)
 
 
-class ComposableBlock(object):
+class BasicBlock(object):
+
+    """Docstring for BasicBlock. """
+
     def __init__(self):
+        """TODO: to be defined1. """
         self.statements = []
 
     def add_statement(self, statement):
         self.statements.append(statement)
 
     def dump(self, tab):
-        output = tab + "ComposableBlock\n"
+        output = tab + self.__class__.__name__ + "\n"
         tab += "    "
         for expr in self.statements:
             if isinstance(expr, ast.Assign):
                 output += tab + "{} = {}\n".format(
                     expr.targets[0].id, dump_op(expr.value))
+            elif isinstance(expr, ast.Return):
+                output += tab + "return {}\n".format(expr.value.id)
         return output
+
+
+class ComposableBasicBlock(BasicBlock):
+    pass
+
+
+class NonComposableBasicBlock(BasicBlock):
+    pass
 
 
 class ControlFlowGraph(object):
@@ -125,30 +134,23 @@ class ControlFlowGraph(object):
         """
         self.name = func.name
         self.params = func.args
-        body = map(unpack, func.body)
-        self.basic_blocks = [list(reduce(lambda x, y: x + y, body, ()))]
+        self.graph = CFGBuilder().visit(func)
 
     def __str__(self):
         output = ""
-        tab = "    "
-        for index, block in enumerate(self.basic_blocks):
-            output += "BasicBlock{}\n".format(index)
-            for expr in block:
-                if isinstance(expr, ast.Assign):
-                    output += tab + "{} = {}\n".format(
-                        expr.targets[0].id, dump_op(expr.value))
-                elif isinstance(expr, ast.Return):
-                    output += tab + "return {}\n".format(expr.value.id)
-                elif isinstance(expr, ComposableBlock):
-                    output += expr.dump(tab)
+        tab = ""
+        for block in self.graph.body:
+            if isinstance(block, BasicBlock):
+                output += block.dump(tab)
+            else:
+                raise NotImplementedError(block)
         return output
 
     def compile_to_fn(self, env):
         # TODO: Should we create a new module/funcdef or just reuse the one
         # passed in
         tree = ast.Module(
-            [ast.FunctionDef(self.name, self.params,
-                             self.basic_blocks[0], [])]
+            [self.graph]
         )
         ast.fix_missing_locations(tree)
         exec(compile(tree, filename=self.name, mode="exec"), env, env)
@@ -157,11 +159,17 @@ class ControlFlowGraph(object):
     def append_composable(self, new_block, specializer, statement,
                           symbol_table, args):
         if len(new_block) < 1 or \
-                not isinstance(new_block[-1], ComposableBlock):
-            new_block.append(ComposableBlock())
+                not isinstance(new_block[-1], ComposableBasicBlock):
+            new_block.append(ComposableBasicBlock())
         new_block[-1].add_statement(statement)
         target = statement.targets[0].id
         symbol_table[target] = specializer.eval_symbolically(*args)
+
+    def append_noncomposable(self, new_block, statement):
+        if len(new_block) < 1 or \
+                not isinstance(new_block[-1], NonComposableBasicBlock):
+            new_block.append(NonComposableBasicBlock())
+        new_block[-1].add_statement(statement)
 
     binop2attr = {
         ast.Add: "__add__",
@@ -177,7 +185,7 @@ class ControlFlowGraph(object):
         ast.Div: "__rdiv__"
     }
 
-    def separate_composable_ops(self, block, symbol_table):
+    def separate_composable_blocks(self, block, symbol_table):
         new_block = []
         for statement in block:
             if isinstance(statement, ast.Assign):
@@ -213,23 +221,20 @@ class ControlFlowGraph(object):
                                                    statement, symbol_table,
                                                    (right, left))
                         else:
-                            new_block.append(statement)
+                            self.append_noncomposable(new_block, statement)
                     else:
-                        new_block.append(statement)
+                        self.append_noncomposable(new_block, statement)
                 else:
-                    new_block.append(statement)
+                    self.append_noncomposable(new_block, statement)
             elif isinstance(statement, ast.Return):
-                new_block.append(statement)
+                self.append_noncomposable(new_block, statement)
             else:
                 raise NotImplementedError(statement)
         return new_block
 
     def find_composable_blocks(self, symbol_table):
-        new_basic_blocks = []
-        for block in self.basic_blocks:
-            new_block = self.separate_composable_ops(block, symbol_table)
-            new_basic_blocks.append(new_block)
-        self.basic_blocks = new_basic_blocks
+        self.graph.body = self.separate_composable_blocks(self.graph.body,
+                                                          symbol_table)
         print(self)
         raise NotImplementedError()
 
